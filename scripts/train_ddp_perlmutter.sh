@@ -12,7 +12,13 @@
 #SBATCH --ntasks-per-node=1
 #SBATCH -c 128
 #SBATCH --gpus-per-node=4
-#SBATCH -t 24:00:00
+# 6 h, not the 24 h cap: full-node requests at 24 h have waited a median of
+# 7.9 h to start on this account, against effectively zero for short ones, and
+# the regular GPU partition routinely sits at several thousand pending jobs.
+# Each job resumes from checkpoints/last.pt and one that finds training already
+# complete exits immediately, so a longer chain of short jobs finishes sooner.
+# Override per submission with `sbatch -t HH:MM:SS`.
+#SBATCH -t 06:00:00
 #SBATCH -J lardiff-ddp
 #SBATCH -o slurm-%j.out
 
