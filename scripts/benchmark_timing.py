@@ -1,20 +1,20 @@
-"""Per-event generation timing, in the layout of the ToyG4 timing benchmark.
+"""Point-model timing against the hit count N, with no weights and no data.
 
-For every (particle, kinetic energy) point, draws the hit count N and response
-R from the global model and generates events at that fixed energy with the
-point model, exactly as `lardiff.generator --n-source global` does.  No cache
-is read: the conditioning is the fixed energy alone.
+The cost of one event is set by the architecture and by its hit count, never
+by the weight values: the per-point layers run on every one of the
+`max_num_points` padded slots, while attention runs only on the
+ceil(N / 128)^2 blocks of real hits.  So a randomly initialised model with
+the run's architecture times the same as the trained one, provided the
+events have the right N.  Without the global model or data there is no
+realistic N per energy, so this sweeps N instead; map energy to N afterwards
+(e.g. from Geant4 output) to read off a per-energy time.
 
-Only sampling is timed.  Model loading and the warm-up batches that trigger
-torch.compile are excluded, as the Geant4 run timer excludes initialisation.
+The architecture, padding length and trafo layout come from a run conf in
+`conf/`.  A temporary run directory with random weights and stand-in trafos is
+written, and the timed code is `lardiff.generator.LArGenerator` itself.  The
+global model is not timed: it is a small MLP over two numbers per event.
 
-    python scripts/benchmark_timing.py [--out timing.md] [--batch-size 100]
-
-Rows default to the two trained point models.  Any other species the global
-model knows can be timed through an existing point model, which is a timing
-proxy only (the hits are drawn from that model's species):
-
-    --point-model=-11=results/20260818_121435_LAr-electron-CNF-v4-cont
+    python scripts/benchmark_timing.py [--out timing.md]
 """
 
 import argparse
@@ -26,75 +26,42 @@ import os
 import platform
 import subprocess
 import sys
+import tempfile
 import time
 
-import numpy as np
 import torch
-from torch import Tensor
+import torch._dynamo
+import yaml
 
+from lardiff import flow_matching as fm
+from lardiff import transformer
 from lardiff.generator import LArGenerator
-from lardiff.global_model import PDG_CODES, GlobalSampler
+from lardiff.preprocessing import compose
 
 logger = logging.getLogger("benchmark_timing")
 
 REPO_DIRECTORY = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
-DEFAULT_POINT_MODELS = [
-    "11=results/20260818_121435_LAr-electron-CNF-v4-cont",
-    "13=results/20260908_211332_LAr-muon-CNF-v4",
-]
-DEFAULT_GLOBAL_MODEL = "results/global_all_species_v5"
-DEFAULT_ENERGIES_GEV = [0.01, 0.1, 0.5, 1.0, 2.0, 5.0, 10.0]
+# conf/lar_muon_v4.yaml has the identical model and max_num_points
+DEFAULT_CONF = os.path.join(REPO_DIRECTORY, "conf", "lar_electron_v4_cont.yaml")
+DEFAULT_NUM_POINTS = [128, 256, 512, 1024, 2048, 4096, 8192]
 
-PARTICLE_LABELS = {
-    11: "e⁻ (11)",
-    -11: "e⁺ (−11)",
-    22: "γ (22)",
-    13: "μ⁻ (13)",
-    -13: "μ⁺ (−13)",
-    211: "π⁺ (211)",
-    -211: "π⁻ (−211)",
-    2212: "p (2212)",
-    2112: "n (2112)",
-}
+# the generator's conditioning check reads log E_dep from the cond scaler, so
+# the stand-in conditioning has to span real energies in MeV
+STANDIN_ENERGY_RANGE_MEV = (10.0, 10_000.0)
+STANDIN_ENERGY_MEV = 1_000.0
 
 
 @dataclasses.dataclass
-class PointTiming:
-    pdg: int
-    energy_gev: float
-    num_events: int
+class SweepTiming:
     batch_size: int
-    global_seconds_per_batch: list[float]
-    point_seconds_per_batch: list[float]
-    mean_num_points: float
-
-    @property
-    def total_seconds(self) -> float:
-        return sum(self.global_seconds_per_batch) + sum(self.point_seconds_per_batch)
+    num_points: int
+    num_events: int
+    seconds_per_batch: list[float]
 
     @property
     def milliseconds_per_event(self) -> float:
-        return 1e3 * self.total_seconds / self.num_events
-
-    @property
-    def global_milliseconds_per_event(self) -> float:
-        return 1e3 * sum(self.global_seconds_per_batch) / self.num_events
-
-
-def parse_point_models(point_model_entries: list[str]) -> dict[int, str]:
-    point_model_by_pdg: dict[int, str] = {}
-    for entry in point_model_entries:
-        pdg_text, separator, run_directory = entry.partition("=")
-        if not separator or not run_directory:
-            raise SystemExit(f"--point-model expects PDG=RUN_DIR, got {entry!r}")
-        pdg = int(pdg_text)
-        if pdg not in PDG_CODES:
-            raise SystemExit(f"PDG {pdg} is not covered by the global model {PDG_CODES}")
-        if not os.path.isdir(run_directory):
-            raise SystemExit(f"no such run directory: {run_directory}")
-        point_model_by_pdg[pdg] = run_directory
-    return point_model_by_pdg
+        return 1e3 * sum(self.seconds_per_batch) / self.num_events
 
 
 def run_git(arguments: list[str]) -> str:
@@ -147,52 +114,90 @@ def synchronize(device: torch.device) -> None:
         torch.cuda.synchronize(device)
 
 
+def write_random_run_directory(conf_path: str, run_directory: str, seed: int) -> dict:
+    """Write conf.yaml, random weights/best.pt and stand-in preprocessing/trafos.pt."""
+    with open(conf_path) as conf_file:
+        run_conf = yaml.safe_load(conf_file)
+    os.makedirs(os.path.join(run_directory, "weights"))
+    os.makedirs(os.path.join(run_directory, "preprocessing"))
+    with open(os.path.join(run_directory, "conf.yaml"), "w") as conf_file:
+        yaml.safe_dump(run_conf, conf_file)
+
+    torch.manual_seed(seed)
+    network_parameters = {
+        key: value for key, value in run_conf["model"].items() if key != "flow_config"
+    }
+    flow_parameters = run_conf["model"].get("flow_config", {})
+    flow = fm.CNF(transformer.Transformer(**network_parameters), **flow_parameters)
+    torch.save(flow.state_dict(), os.path.join(run_directory, "weights", "best.pt"))
+    logger.debug(
+        "random point model: %d parameters", sum(p.numel() for p in flow.parameters())
+    )
+
+    # the trafo values only shift and scale the output; fitting on synthetic
+    # data gives buffers of the right shapes, which is all the timing needs
+    data_conf = run_conf["data"]
+    standin_points = torch.rand(16, 256, 4) + 0.1
+    standin_mask = torch.ones(16, 256, 1, dtype=torch.bool)
+    low_energy_mev, high_energy_mev = STANDIN_ENERGY_RANGE_MEV
+    standin_cond = low_energy_mev + (high_energy_mev - low_energy_mev) * torch.rand(1024, 3)
+
+    samples_coordinate_trafo = compose(data_conf.get("samples_coordinate_trafo"))
+    samples_coordinate_trafo.fit(standin_points[:, :, :3], standin_mask)
+    samples_energy_trafo = compose(data_conf.get("samples_energy_trafo"))
+    samples_energy_trafo.fit(standin_points[:, :, 3], standin_mask.squeeze(-1))
+    cond_trafo = compose(data_conf.get("cond_trafo"))
+    cond_trafo.fit(standin_cond)
+    torch.save(
+        {
+            "samples_coordinate_trafo": samples_coordinate_trafo.state_dict(),
+            "samples_energy_trafo": samples_energy_trafo.state_dict(),
+            "cond_trafo": cond_trafo.state_dict(),
+        },
+        os.path.join(run_directory, "preprocessing", "trafos.pt"),
+    )
+    return run_conf
+
+
 def generate_batch(
     generator: LArGenerator,
-    global_sampler: GlobalSampler,
-    energy_mev: float,
-    pdg: int,
+    num_points: int,
     batch_size: int,
     device: torch.device,
     renormalize: bool,
-) -> tuple[float, float, Tensor]:
-    """Return (global seconds, point seconds, conditioned hit counts) for one batch."""
-    energies = torch.full((batch_size,), energy_mev, dtype=torch.float32)
+) -> float:
+    energies = torch.full((batch_size,), STANDIN_ENERGY_MEV, device=device)
+    num_points_per_event = torch.full((batch_size,), num_points, dtype=torch.long, device=device)
+    ratios = torch.ones(batch_size, device=device)
     needs_ratio = generator.cond_dim > 2 or renormalize
 
     synchronize(device)
-    global_start = time.perf_counter()
-    num_points, ratios = global_sampler.sample(
-        energies, pdg=pdg, max_num_points=generator.max_points
-    )
-    synchronize(device)
-    point_start = time.perf_counter()
+    batch_start = time.perf_counter()
     samples = generator(
-        energies.to(device),
-        num_points.to(device),
-        ratio=ratios.to(device) if needs_ratio else None,
+        energies,
+        num_points_per_event,
+        ratio=ratios if needs_ratio else None,
         renormalize=renormalize,
     ).cpu()
     synchronize(device)
-    point_end = time.perf_counter()
+    batch_seconds = time.perf_counter() - batch_start
 
     logger.debug(
-        "pdg %d, %g MeV: global %.4f s, point %.4f s, mean N %.1f, samples %s",
-        pdg, energy_mev, point_start - global_start, point_end - point_start,
-        num_points.float().mean().item(), tuple(samples.shape),
+        "batch %d, N %d: %.4f s, samples %s",
+        batch_size, num_points, batch_seconds, tuple(samples.shape),
     )
-    return point_start - global_start, point_end - point_start, num_points
+    return batch_seconds
 
 
-def time_species(
-    pdg: int,
+def time_batch_size(
     run_directory: str,
-    global_sampler: GlobalSampler,
+    batch_size: int,
     parsed_arguments: argparse.Namespace,
     device: torch.device,
-) -> tuple[list[PointTiming], int]:
-    """Return the timings at every energy and the model's padded event length."""
-    logger.info("pdg %d: loading point model %s", pdg, run_directory)
+) -> list[SweepTiming]:
+    # each batch size is its own compiled shape; resetting stops dynamo from
+    # switching to dynamic-shape kernels after it has seen a second size
+    torch._dynamo.reset()
     generator = LArGenerator(
         run_dir=run_directory,
         num_timesteps=parsed_arguments.num_timesteps,
@@ -200,142 +205,95 @@ def time_species(
         solver=parsed_arguments.solver,
     ).to(device)
     generator.eval()
-    if generator.num_particles > 1:
-        raise SystemExit(
-            f"{run_directory} is a multi-species model; its particle labels come "
-            "from the cache's species list, which this benchmark does not read"
-        )
 
-    # alternate between the extreme energies, so the compiled graph has seen
-    # both the sparsest and the densest block masks before timing starts
+    # alternate between the extreme N, so the compiled graph has seen both
+    # the sparsest and the densest block masks before timing starts
     for warmup_index in range(parsed_arguments.warmup_batches):
-        warmup_energy_gev = parsed_arguments.energies[-1 if warmup_index % 2 else 0]
-        logger.info("pdg %d: warm-up batch %d at %g GeV", pdg, warmup_index, warmup_energy_gev)
-        warmup_global_seconds, warmup_point_seconds, _ = generate_batch(
-            generator, global_sampler, 1e3 * warmup_energy_gev, pdg,
-            parsed_arguments.batch_size, device, parsed_arguments.renormalize,
-        )
-        logger.debug(
-            "pdg %d: warm-up batch %d took %.2f s",
-            pdg, warmup_index, warmup_global_seconds + warmup_point_seconds,
-        )
-
-    num_batches = parsed_arguments.events_per_point // parsed_arguments.batch_size
-    point_timings: list[PointTiming] = []
-    for energy_gev in parsed_arguments.energies:
-        global_seconds_per_batch: list[float] = []
-        point_seconds_per_batch: list[float] = []
-        conditioned_counts: list[Tensor] = []
-        for _ in range(num_batches):
-            global_seconds, point_seconds, num_points = generate_batch(
-                generator, global_sampler, 1e3 * energy_gev, pdg,
-                parsed_arguments.batch_size, device, parsed_arguments.renormalize,
-            )
-            global_seconds_per_batch.append(global_seconds)
-            point_seconds_per_batch.append(point_seconds)
-            conditioned_counts.append(num_points)
-
-        point_timing = PointTiming(
-            pdg=pdg,
-            energy_gev=energy_gev,
-            num_events=parsed_arguments.events_per_point,
-            batch_size=parsed_arguments.batch_size,
-            global_seconds_per_batch=global_seconds_per_batch,
-            point_seconds_per_batch=point_seconds_per_batch,
-            mean_num_points=torch.cat(conditioned_counts).float().mean().item(),
+        warmup_num_points = parsed_arguments.num_points[-1 if warmup_index % 2 else 0]
+        warmup_seconds = generate_batch(
+            generator, warmup_num_points, batch_size, device, parsed_arguments.renormalize
         )
         logger.info(
-            "pdg %d, %g GeV: %.3f ms/event (global model %.3f ms/event), mean N %.1f",
-            pdg, energy_gev, point_timing.milliseconds_per_event,
-            point_timing.global_milliseconds_per_event, point_timing.mean_num_points,
+            "batch %d: warm-up %d at N %d took %.2f s",
+            batch_size, warmup_index, warmup_num_points, warmup_seconds,
         )
-        point_timings.append(point_timing)
 
-    max_points = generator.max_points
+    num_batches = parsed_arguments.events_per_point // batch_size
+    sweep_timings: list[SweepTiming] = []
+    for num_points in parsed_arguments.num_points:
+        seconds_per_batch = [
+            generate_batch(generator, num_points, batch_size, device, parsed_arguments.renormalize)
+            for _ in range(num_batches)
+        ]
+        sweep_timing = SweepTiming(
+            batch_size=batch_size,
+            num_points=num_points,
+            num_events=parsed_arguments.events_per_point,
+            seconds_per_batch=seconds_per_batch,
+        )
+        logger.info(
+            "batch %d, N %d: %.3f ms/event",
+            batch_size, num_points, sweep_timing.milliseconds_per_event,
+        )
+        sweep_timings.append(sweep_timing)
+
     del generator
     if device.type == "cuda":
         torch.cuda.empty_cache()
-    return point_timings, max_points
-
-
-def format_table(
-    title: str,
-    point_timings: list[PointTiming],
-    pdg_order: list[int],
-    energies_gev: list[float],
-    value_format: str,
-    value_name: str,
-) -> list[str]:
-    value_by_point = {
-        (point_timing.pdg, point_timing.energy_gev): getattr(point_timing, value_name)
-        for point_timing in point_timings
-    }
-    header_cells = ["Particle"] + [f"{energy_gev:g} GeV" for energy_gev in energies_gev]
-    table_lines = [
-        title,
-        "",
-        "| " + " | ".join(header_cells) + " |",
-        "|" + "|".join(["---"] + ["---:"] * len(energies_gev)) + "|",
-    ]
-    for pdg in pdg_order:
-        row_cells = [PARTICLE_LABELS.get(pdg, str(pdg))] + [
-            format(value_by_point[(pdg, energy_gev)], value_format)
-            for energy_gev in energies_gev
-        ]
-        table_lines.append("| " + " | ".join(row_cells) + " |")
-    return table_lines
+    return sweep_timings
 
 
 def format_report(
-    point_timings: list[PointTiming],
-    point_model_by_pdg: dict[int, str],
+    sweep_timings: list[SweepTiming],
+    run_conf: dict,
     parsed_arguments: argparse.Namespace,
     device: torch.device,
-    max_points_by_pdg: dict[int, int],
 ) -> str:
-    pdg_order = list(point_model_by_pdg)
-    point_model_description = "; ".join(
-        f"{PARTICLE_LABELS.get(pdg, str(pdg))} ← {os.path.basename(os.path.normpath(run_directory))}"
-        f" (max {max_points_by_pdg[pdg]} points)"
-        for pdg, run_directory in point_model_by_pdg.items()
-    )
+    model_conf = run_conf["model"]
     compile_description = "torch.compile on" if parsed_arguments.compile else "torch.compile off"
-    renormalize_description = "renormalized to drawn R" if parsed_arguments.renormalize else "not renormalized"
+    renormalize_description = "renormalized" if parsed_arguments.renormalize else "not renormalized"
+    absolute_conf_path = os.path.abspath(parsed_arguments.conf)
+    conf_description = (
+        os.path.relpath(absolute_conf_path, REPO_DIRECTORY)
+        if absolute_conf_path.startswith(REPO_DIRECTORY + os.sep)
+        else absolute_conf_path
+    )
+    milliseconds_by_point = {
+        (sweep_timing.batch_size, sweep_timing.num_points): sweep_timing.milliseconds_per_event
+        for sweep_timing in sweep_timings
+    }
 
     report_lines = [
-        "LArFlow (lardiff) per-event timing benchmark",
+        "LArFlow (lardiff) point-model timing against hit count",
         "",
         f"- **Code:** {describe_code()}",
         f"- **Software:** {describe_software()}",
         f"- **Machine:** {describe_machine(device)}",
-        f"- **Setup:** point models {point_model_description}; global model "
-        f"{os.path.basename(os.path.normpath(parsed_arguments.global_model))}; "
+        f"- **Setup:** architecture of {conf_description} "
+        f"({model_conf['num_blocks']} blocks, {model_conf['num_head']} heads, embedding "
+        f"{model_conf['dim_embedding']}, feedforward {model_conf['dim_feedforward']}, "
+        f"padded to {run_conf['data']['max_num_points']} points), random weights; "
         f"{parsed_arguments.solver} solver, {parsed_arguments.num_timesteps} steps; "
         f"float32, matmul precision \"high\" (TF32 on Ampere+); {compile_description}; "
-        f"{renormalize_description}; "
-        f"seed {parsed_arguments.seed}",
-        f"- **Sample:** {parsed_arguments.events_per_point} events per (particle, energy) "
-        f"point, fixed kinetic energy, batch size {parsed_arguments.batch_size}, "
-        "N and R drawn from the global model",
-        "- **Timer:** wall clock (time.perf_counter, CUDA synchronized) around global-model "
-        "sampling, point-model sampling and the copy to host; excludes model loading and "
-        f"{parsed_arguments.warmup_batches} warm-up batches per particle (torch.compile)",
+        f"{renormalize_description}; seed {parsed_arguments.seed}",
+        f"- **Sample:** {parsed_arguments.events_per_point} events per (batch size, N) point, "
+        "every event in a batch with the same N",
+        "- **Timer:** wall clock (time.perf_counter, CUDA synchronized) around point-model "
+        "sampling and the copy to host; excludes model building, "
+        f"{parsed_arguments.warmup_batches} warm-up batches per batch size (torch.compile), "
+        "and the global model",
         "",
+        "Wall time per event (ms)",
+        "",
+        "| Batch size | " + " | ".join(f"N = {num_points}" for num_points in parsed_arguments.num_points) + " |",
+        "|" + "|".join(["---"] + ["---:"] * len(parsed_arguments.num_points)) + "|",
     ]
-    report_lines += format_table(
-        "Wall time per event (ms)", point_timings, pdg_order,
-        parsed_arguments.energies, ".3f", "milliseconds_per_event",
-    )
-    report_lines.append("")
-    report_lines += format_table(
-        "of which global model (ms)", point_timings, pdg_order,
-        parsed_arguments.energies, ".3f", "global_milliseconds_per_event",
-    )
-    report_lines.append("")
-    report_lines += format_table(
-        "Mean hits per event (N from the global model)", point_timings, pdg_order,
-        parsed_arguments.energies, ".1f", "mean_num_points",
-    )
+    for batch_size in parsed_arguments.batch_sizes:
+        row_cells = [str(batch_size)] + [
+            f"{milliseconds_by_point[(batch_size, num_points)]:.3f}"
+            for num_points in parsed_arguments.num_points
+        ]
+        report_lines.append("| " + " | ".join(row_cells) + " |")
     return "\n".join(report_lines) + "\n"
 
 
@@ -344,29 +302,25 @@ def get_arguments(arguments: list[str] | None = None) -> argparse.Namespace:
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
     parser.add_argument(
-        "--point-model", action="append", default=None, metavar="PDG=RUN_DIR",
-        help="point model to time for a species; repeat for each row. Write "
-             "negative codes as --point-model=-11=RUN_DIR. default: "
-             + ", ".join(DEFAULT_POINT_MODELS),
+        "--conf", default=DEFAULT_CONF,
+        help="run conf whose architecture is timed. default: %(default)s",
     )
-    parser.add_argument("--global-model", default=DEFAULT_GLOBAL_MODEL)
     parser.add_argument(
-        "--energies", type=float, nargs="+", default=DEFAULT_ENERGIES_GEV,
-        help="kinetic energies in GeV. default: %(default)s",
+        "--num-points", type=int, nargs="+", default=DEFAULT_NUM_POINTS,
+        help="hit counts to sweep, each at most the conf's max_num_points. default: %(default)s",
+    )
+    parser.add_argument(
+        "--batch-sizes", type=int, nargs="+", default=[100],
+        help="one table row per batch size; each must divide --events-per-point. "
+             "default: %(default)s",
     )
     parser.add_argument("-n", "--events-per-point", type=int, default=100)
-    parser.add_argument(
-        "-b", "--batch-size", type=int, default=100,
-        help="events per generator call; must divide --events-per-point so "
-             "every batch has the compiled shape. default: 100",
-    )
     parser.add_argument("--warmup-batches", type=int, default=2)
     parser.add_argument("--num-timesteps", type=int, default=200)
     parser.add_argument("--solver", default="heun")
     parser.add_argument(
         "--no-renormalize", dest="renormalize", action="store_false",
-        help="skip rescaling each event to the drawn R (on by default, as in "
-             "the production generation commands)",
+        help="skip the per-event energy rescaling (on by default, as in production)",
     )
     parser.add_argument(
         "--no-compile", dest="compile", action="store_false",
@@ -392,15 +346,13 @@ def main(arguments: list[str] | None = None) -> None:
         stream=sys.stdout,
     )
 
-    if parsed_arguments.events_per_point % parsed_arguments.batch_size != 0:
-        raise SystemExit(
-            f"--batch-size {parsed_arguments.batch_size} does not divide "
-            f"--events-per-point {parsed_arguments.events_per_point}; a ragged "
-            "last batch would recompile inside the timed region"
-        )
-    point_model_by_pdg = parse_point_models(parsed_arguments.point_model or DEFAULT_POINT_MODELS)
-    if not os.path.isdir(parsed_arguments.global_model):
-        raise SystemExit(f"no such global model directory: {parsed_arguments.global_model}")
+    for batch_size in parsed_arguments.batch_sizes:
+        if parsed_arguments.events_per_point % batch_size != 0:
+            raise SystemExit(
+                f"batch size {batch_size} does not divide --events-per-point "
+                f"{parsed_arguments.events_per_point}; a ragged last batch would "
+                "recompile inside the timed region"
+            )
 
     if parsed_arguments.device:
         device = torch.device(parsed_arguments.device)
@@ -415,31 +367,31 @@ def main(arguments: list[str] | None = None) -> None:
     logger.debug("arguments: %s", vars(parsed_arguments))
 
     torch.set_float32_matmul_precision("high")
-    torch.manual_seed(parsed_arguments.seed)
-    np.random.seed(parsed_arguments.seed)
 
-    logger.info("loading global model %s", parsed_arguments.global_model)
-    global_sampler = GlobalSampler(parsed_arguments.global_model, device=device)
-
-    point_timings: list[PointTiming] = []
-    max_points_by_pdg: dict[int, int] = {}
-    for pdg, run_directory in point_model_by_pdg.items():
-        species_timings, max_points_by_pdg[pdg] = time_species(
-            pdg, run_directory, global_sampler, parsed_arguments, device
+    sweep_timings: list[SweepTiming] = []
+    with tempfile.TemporaryDirectory() as temporary_directory:
+        run_directory = os.path.join(temporary_directory, "random_run")
+        run_conf = write_random_run_directory(
+            parsed_arguments.conf, run_directory, parsed_arguments.seed
         )
-        point_timings += species_timings
+        max_num_points = run_conf["data"]["max_num_points"]
+        if max(parsed_arguments.num_points) > max_num_points:
+            raise SystemExit(
+                f"--num-points goes above the conf's max_num_points {max_num_points}; "
+                "the generator would clamp those events"
+            )
+        torch.manual_seed(parsed_arguments.seed)
+        for batch_size in parsed_arguments.batch_sizes:
+            sweep_timings += time_batch_size(run_directory, batch_size, parsed_arguments, device)
 
-    report = format_report(
-        point_timings, point_model_by_pdg, parsed_arguments, device, max_points_by_pdg
-    )
+    report = format_report(sweep_timings, run_conf, parsed_arguments, device)
     print()
     print(report)
 
     report_path = parsed_arguments.out or (
         f"timing_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.md"
     )
-    report_directory = os.path.dirname(os.path.abspath(report_path))
-    os.makedirs(report_directory, exist_ok=True)
+    os.makedirs(os.path.dirname(os.path.abspath(report_path)), exist_ok=True)
     with open(report_path, "w") as report_file:
         report_file.write(report)
 
@@ -448,14 +400,13 @@ def main(arguments: list[str] | None = None) -> None:
         json.dump(
             {
                 "arguments": vars(parsed_arguments),
-                "point_models": {str(pdg): path for pdg, path in point_model_by_pdg.items()},
                 "code": describe_code(),
                 "software": describe_software(),
                 "machine": describe_machine(device),
                 "points": [
-                    dataclasses.asdict(point_timing)
-                    | {"milliseconds_per_event": point_timing.milliseconds_per_event}
-                    for point_timing in point_timings
+                    dataclasses.asdict(sweep_timing)
+                    | {"milliseconds_per_event": sweep_timing.milliseconds_per_event}
+                    for sweep_timing in sweep_timings
                 ],
             },
             json_file,
